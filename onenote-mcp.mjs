@@ -10,8 +10,8 @@ import fs from 'fs';
 import { DeviceCodeCredential } from '@azure/identity';
 import fetch from 'node-fetch';
 
-// Load environment variables
-dotenv.config();
+// Load environment variables from the .env next to this file (the server may be started from any cwd)
+dotenv.config({ path: fileURLToPath(new URL('.env', import.meta.url)) });
 
 // Get the current file's directory
 const __filename = fileURLToPath(import.meta.url);
@@ -62,8 +62,10 @@ if (!accessToken && process.env.GRAPH_ACCESS_TOKEN) {
 let graphClient = null;
 
 // Client ID for Microsoft Graph API access
-const clientId = '14d82eec-204b-4c2f-b7e8-296a70dab67e'; // Microsoft Graph Explorer client ID
-const scopes = ['Notes.Read.All', 'Notes.ReadWrite.All', 'User.Read'];
+// Client ID from .env (your own Entra app registration), falling back to the Microsoft Graph Explorer client ID
+const clientId = process.env.ONENOTE_CLIENT_ID || '14d82eec-204b-4c2f-b7e8-296a70dab67e';
+// Personal Microsoft accounts only accept Notes.Read/Notes.ReadWrite; the .All variants are work/school only
+const scopes = ['Notes.ReadWrite', 'User.Read'];
 
 // Function to ensure Graph client is created
 async function ensureGraphClient() {
