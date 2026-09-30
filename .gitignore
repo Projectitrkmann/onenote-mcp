@@ -54,3 +54,6 @@ Thumbs.db
 .rts2_cache_cjs/
 .rts2_cache_es/
 .rts2_cache_umd/ 
+
+# MCP TypeScript SDK (clone local, v1.10.0)
+typescript-sdk/
