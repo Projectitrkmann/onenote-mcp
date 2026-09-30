@@ -3,6 +3,7 @@
 import { McpServer } from './typescript-sdk/dist/esm/server/mcp.js';
 import { Client } from '@microsoft/microsoft-graph-client';
 import { StdioServerTransport } from './typescript-sdk/dist/esm/server/stdio.js';
+import { z } from 'zod';
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
 import path from 'path';
@@ -422,46 +423,115 @@ server.tool(
   }
 );
 
+// Escape text for safe inclusion in the page HTML
+function escapeHtml(text) {
+  return String(text)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+// Find exactly one item by display name (case-insensitive), or explain what exists
+function pickByName(items, name, kind, where) {
+  const matches = items.filter(i => i.displayName.toLowerCase() === name.toLowerCase());
+  if (matches.length === 0) {
+    const available = items.map(i => i.displayName).join(', ') || '(none)';
+    throw new Error(`${kind} "${name}" not found in ${where}. Available: ${available}`);
+  }
+  if (matches.length > 1) {
+    const ids = matches.map(i => i.id).join(', ');
+    throw new Error(`${kind} "${name}" is ambiguous in ${where} (ids: ${ids}). Pass notebookId/sectionId instead.`);
+  }
+  return matches[0];
+}
+
+// Resolve "Notebook/Group/.../Section" to a section id. The notebook part is
+// skipped when notebookId is given, so duplicate notebook names can be disambiguated.
+async function resolveSectionPath(sectionPath, notebookId) {
+  const parts = sectionPath.split('/').map(p => p.trim()).filter(Boolean);
+  let notebook;
+  if (notebookId) {
+    notebook = await graphClient.api(`/me/onenote/notebooks/${notebookId}`).select('id,displayName').get();
+  } else {
+    const notebooks = await graphClient.api('/me/onenote/notebooks').select('id,displayName').get();
+    notebook = pickByName(notebooks.value, parts.shift() ?? '', 'Notebook', 'your account');
+  }
+  if (parts.length === 0) {
+    throw new Error('sectionPath must end with a section name');
+  }
+
+  const sectionName = parts.pop();
+  let containerUrl = `/me/onenote/notebooks/${notebook.id}`;
+  let where = notebook.displayName;
+  for (const groupName of parts) {
+    const groups = await graphClient.api(`${containerUrl}/sectionGroups`).select('id,displayName').get();
+    const group = pickByName(groups.value, groupName, 'Section group', where);
+    containerUrl = `/me/onenote/sectionGroups/${group.id}`;
+    where = `${where}/${group.displayName}`;
+  }
+  const sections = await graphClient.api(`${containerUrl}/sections`).select('id,displayName').get();
+  return pickByName(sections.value, sectionName, 'Section', where).id;
+}
+
 // Tool for creating a new page in a section
 server.tool(
   "createPage",
-  "Create a new page in a section",
-  async (params) => {
+  "Create a new OneNote page. Target the section with sectionId, or with sectionPath " +
+    "(\"Notebook/Group/Subgroup/Section\"; when notebookId is given, omit the notebook part).",
+  {
+    title: z.string().describe("Page title"),
+    content: z.string().optional().describe(
+      "Page body. HTML fragments (e.g. <p>, <h2>, <ul>, <table>) are kept as-is; plain text is escaped and split into paragraphs"
+    ),
+    sectionId: z.string().optional().describe("Target section id"),
+    sectionPath: z.string().optional().describe("Target section path, e.g. \"Projectit/Clientes/1-Tromink/SAP/SAP-MM\""),
+    notebookId: z.string().optional().describe("Notebook id used with sectionPath when notebook names are duplicated"),
+  },
+  async ({ title, content, sectionId, sectionPath, notebookId }) => {
     try {
       await ensureGraphClient();
-      // Get sections first
-      const sectionsResponse = await graphClient.api(`/me/onenote/sections`).get();
-      
-      if (sectionsResponse.value.length === 0) {
-        throw new Error("No sections found");
+
+      if (!sectionId && !sectionPath) {
+        throw new Error("Provide sectionId or sectionPath");
       }
-      
-      // Use the first section
-      const sectionId = sectionsResponse.value[0].id;
-      
-      // Create simple HTML content
-      const simpleHtml = `
-        <!DOCTYPE html>
-        <html>
-          <head>
-            <title>New Page</title>
-          </head>
-          <body>
-            <p>This is a new page created via the Microsoft Graph API</p>
-          </body>
-        </html>
-      `;
-      
+      const targetSectionId = sectionId || await resolveSectionPath(sectionPath, notebookId);
+
+      let body = '';
+      if (content) {
+        const looksLikeHtml = /<\/?[a-z][\s\S]*>/i.test(content);
+        body = looksLikeHtml
+          ? content
+          : content.split(/\r?\n\s*\r?\n/).map(p => `<p>${escapeHtml(p).replace(/\r?\n/g, '<br/>')}</p>`).join('\n');
+      }
+
+      const html = `<!DOCTYPE html>
+<html>
+  <head>
+    <title>${escapeHtml(title)}</title>
+    <meta name="created" content="${new Date().toISOString()}" />
+  </head>
+  <body>
+${body}
+  </body>
+</html>`;
+
       const response = await graphClient
-        .api(`/me/onenote/sections/${sectionId}/pages`)
+        .api(`/me/onenote/sections/${targetSectionId}/pages`)
         .header("Content-Type", "application/xhtml+xml")
-        .post(simpleHtml);
-      
-      return { 
+        .post(html);
+
+      return {
         content: [
           {
             type: "text",
-            text: JSON.stringify(response)
+            text: JSON.stringify({
+              id: response.id,
+              title: response.title,
+              sectionId: targetSectionId,
+              createdDateTime: response.createdDateTime,
+              webUrl: response.links?.oneNoteWebUrl?.href,
+            })
           }
         ]
       };
